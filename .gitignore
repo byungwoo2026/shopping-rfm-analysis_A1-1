@@ -8,3 +8,6 @@ data/
 __pycache__/
 *.pyc
 .ipynb_checkpoints/
+
+# 터미널로 노트북을 실행했을 때 저장되는 결과물 (README 3-4)
+results/
