@@ -4,10 +4,12 @@ CSV 표 하나를 불러와서 정리하고 분석하는 메서드를 한 클래
 같은 클래스로 거래표(Online Retail II)와 상품표(Fashion)를 각각 다룹니다.
 (표마다 DataAnalyzer를 하나씩 만들므로 인스턴스가 2개가 됩니다.)
 """
+from collections import Counter
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
+from matplotlib import image as mpimg    # mpimg.imread(): 사진 파일을 숫자 배열로 읽는 함수 (plt.imread와 같은 함수)
 
 # Online Retail II 원본 컬럼명 → 분석에 쓸 이름(공백 없는 소문자_밑줄 형식)
 # 'Customer ID'처럼 공백이 있으면 코드에서 쓰기 불편하고, 과제 요구 컬럼명(customer_id,
@@ -87,6 +89,7 @@ class DataAnalyzer:
         self.missing_log = []       # handle_missing_values()를 부를 때마다 한 줄(딕셔너리)씩 쌓임
         self.cancel_rows = None     # clean_transactions()가 지운 취소 전표(원 주문과 짝을 맞출 때 필요)
         self.cancelled_orders = None  # remove_cancelled_orders()가 지운 "취소로 사라진 원 주문" 행들
+        self.image_log = None       # load_images()가 남기는 "사진을 몇 장 찾고 몇 장 썼는지" 기록
 
     # ───────────── 불러오기 ─────────────
     def load_data(self, date_cols=None, rename=None, **read_csv_kwargs):
@@ -350,3 +353,86 @@ class DataAnalyzer:
             treated = values.where(in_range)                                            # 범위 밖은 NaN
             treated.name = f"{column}_removed"
         return treated
+
+    # ───────────── 텍스트 피처 ─────────────
+    def add_text_features(self, text_col, prefix=None):
+        """글자 컬럼에서 단어 수·글자 수를 세어 새 컬럼 두 개를 추가한다.
+
+        text_col : 글자가 들어 있는 컬럼 (예: 상품명)
+        prefix   : 새 컬럼 이름의 앞부분. 안 주면 text_col 이름을 쓴다 → "{prefix}_word_count", "{prefix}_char_count"
+        단어 수 = 공백으로 나눈 조각 수 (연속 공백도 한 번의 구분으로 침),
+        글자 수 = 앞뒤 공백을 뺀 길이 (가운데 공백은 포함).
+        빈칸(NaN)인 행은 새 컬럼도 빈칸으로 둔다. 새로 만든 두 컬럼을 표로 돌려준다.
+        """
+        if self.df is None:
+            raise ValueError("먼저 load_data()로 데이터를 불러오세요.")
+        if text_col not in self.df.columns:
+            raise KeyError(f"표에 없는 컬럼입니다: {text_col!r}")
+        if not pd.api.types.is_string_dtype(self.df[text_col]) and not pd.api.types.is_object_dtype(self.df[text_col]):
+            raise TypeError(f"{text_col!r}는 글자 컬럼이 아닙니다.")
+        prefix = text_col if prefix is None else prefix
+        word_col, char_col = f"{prefix}_word_count", f"{prefix}_char_count"
+        text = self.df[text_col]
+        self.df[word_col] = text.str.split().str.len()         # 공백 기준으로 쪼갠 조각의 개수
+        self.df[char_col] = text.str.strip().str.len()         # 앞뒤 공백을 뺀 글자 수
+        return self.df[[word_col, char_col]]
+
+    # ───────────── 이미지 피처 ─────────────
+    def load_images(self, ids, image_dir, expected_shape=(80, 60, 3)):
+        """상품 id 목록에 해당하는 사진 파일({id}.jpg)을 읽어, 크기가 같은 것만 하나의 배열로 쌓는다.
+
+        expected_shape : 쌓을 사진의 크기 (세로, 가로, 색 3개). 이 크기와 다른 사진(흑백 등)은 건너뛴다.
+        돌려주는 값: (images, used_ids)
+          images   : (사진 수 N, 세로, 가로, 3) 모양의 uint8 배열. 값은 0(어두움)~255(밝음)
+          used_ids : 실제로 쌓은 사진의 id 목록 (길이 N, images와 같은 순서)
+        사진을 한 장씩 읽는 것은 파일 입출력이라 반복이 필요하다. 평균·표준편차 계산에는 반복을 쓰지 않는다.
+        몇 장을 찾고 몇 장을 건너뛰었는지는 self.image_log 에 남긴다.
+        """
+        image_dir = Path(image_dir)
+        expected_shape = tuple(expected_shape)
+        found = [(i, image_dir / f"{i}.jpg") for i in ids if (image_dir / f"{i}.jpg").exists()]   # 파일이 있는 것만
+        arrays = [(i, mpimg.imread(path)) for i, path in found]                                   # 한 장씩 읽기 (반복이 필요한 부분)
+        same_size = [(i, array) for i, array in arrays if array.shape == expected_shape]         # 크기가 맞는 것만
+        if not same_size:
+            raise ValueError(f"크기가 {expected_shape}인 사진을 하나도 찾지 못했습니다.")
+        used_ids = [i for i, _ in same_size]
+        images = np.stack([array for _, array in same_size])      # 사진 N장을 (N, 세로, 가로, 3) 하나의 큰 상자로 쌓음
+        self.image_log = {
+            "요청한 id": len(ids),
+            "파일을 찾음": len(found),
+            "쌓은 사진": len(same_size),
+            "크기가 달라 건너뜀": len(arrays) - len(same_size),
+            "건너뛴 사진의 크기": dict(Counter(str(a.shape) for _, a in arrays if a.shape != expected_shape)),
+        }
+        return images, used_ids
+
+    def extract_image_features(self, images, ids=None, step=1):
+        """사진 배열에서 사진별 평균·표준편차를 구한다. 반복문 없이 배열 연산 한 번으로 계산한다.
+
+        images : (사진 수 N, 세로, 가로[, 색]) 배열. 0번 축이 "사진 번호"
+        ids    : images와 같은 순서의 상품 id 목록. 주면 결과를 self.df 의 image_mean, image_std 컬럼에도 넣는다
+                 (사진이 없는 행은 빈칸). 안 주면 결과 표만 돌려주고 self.df 는 건드리지 않는다.
+        step   : 다운샘플 간격. 2이면 가로·세로로 한 칸씩 건너뛰며 (4분의 1만) 계산해 더 빠르지만 근사값이 된다.
+        image_mean = 사진 전체의 밝기(0~255), image_std = 밝은 부분과 어두운 부분의 차이(대비).
+        """
+        images = np.asarray(images)
+        if images.ndim < 3:
+            raise ValueError("images는 (사진 수, 세로, 가로[, 색]) 모양의 배열이어야 합니다.")
+        if step < 1 or int(step) != step:
+            raise ValueError(f"step은 1 이상의 정수여야 합니다: {step}")
+        if ids is not None and len(ids) != len(images):
+            raise ValueError(f"ids({len(ids)}개)와 사진 수({len(images)}장)가 다릅니다.")
+        if ids is not None and self.df is None:
+            raise ValueError("먼저 load_data()로 데이터를 불러오세요.")
+
+        pixels = images[:, ::step, ::step]                         # 세로·가로를 step칸 간격으로 (step=1이면 전부)
+        axes = tuple(range(1, pixels.ndim))                        # 0번 축(사진 번호)만 남기고 나머지 축 전부
+        features = pd.DataFrame({
+            "image_mean": pixels.mean(axis=axes),                  # 사진 N장의 평균이 한 번에 나옴 → 길이 N
+            "image_std": pixels.std(axis=axes),                    # 사진 N장의 표준편차가 한 번에 나옴 → 길이 N
+        })
+        if ids is None:
+            return features
+        features.insert(0, "id", list(ids))
+        self.df = self.df.drop(columns=["image_mean", "image_std"], errors="ignore").merge(features, on="id", how="left")
+        return features
