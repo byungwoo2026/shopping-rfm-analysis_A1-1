@@ -24,6 +24,38 @@ RETAIL_RENAME = {
 }
 
 
+# 상품이 아닌 상품코드(배송비·수기 입력·수수료·조정·테스트). 고객이 상품을 산 매출이 아니라서
+# 매출·이상치를 볼 때 따로 구분해야 한다. (실제 상품인 DCGS…, gift_0001_… 코드는 넣지 않음)
+NON_PRODUCT_CODES = {
+    "POST": "배송비(우편)", "DOT": "배송비(닷컴)", "C2": "운송비",
+    "M": "수기 입력", "m": "수기 입력",
+    "ADJUST": "금액 조정", "ADJUST2": "금액 조정", "B": "부실채권 조정",
+    "BANK CHARGES": "은행 수수료", "AMAZONFEE": "아마존 수수료",
+    "D": "할인", "S": "샘플", "TEST001": "테스트", "TEST002": "테스트",
+}
+
+
+def iqr_bounds(values, threshold=1.5):
+    """IQR 방식으로 '정상 범위'를 구한다.
+
+    ① 값을 크기순으로 줄 세운 뒤 25% 지점 = Q1, 75% 지점 = Q3
+    ② IQR = Q3 - Q1  (가운데 50% 데이터가 퍼져 있는 폭)
+    ③ 정상 범위 = Q1 - threshold × IQR  ~  Q3 + threshold × IQR
+       이 범위 밖의 값이 이상치다. threshold의 관례값은 1.5이고, 클수록 범위가 넓어져 이상치가 줄어든다.
+
+    돌려주는 값: {"q1", "q3", "iqr", "lower"(하한), "upper"(상한)} 딕셔너리
+    빈칸(NaN)은 계산에서 빠진다.
+    """
+    if threshold < 0:
+        raise ValueError(f"threshold는 0 이상이어야 합니다: {threshold}")
+    values = pd.Series(values).dropna()
+    q1 = values.quantile(0.25)          # 25% 지점 (사이 값은 앞뒤 두 값을 비율로 섞어서 구함)
+    q3 = values.quantile(0.75)          # 75% 지점
+    iqr = q3 - q1
+    return {"q1": q1, "q3": q3, "iqr": iqr,
+            "lower": q1 - threshold * iqr, "upper": q3 + threshold * iqr}
+
+
 def _mode(values):
     """최빈값(가장 많이 나온 값) 하나를 돌려준다. 값이 하나도 없으면 NaN.
 
@@ -53,6 +85,8 @@ class DataAnalyzer:
         self.df = None              # 불러온 표. load_data()를 부르기 전에는 비어 있음
         self.cleaning_log = None    # clean_transactions()가 남기는 "단계별 제거 행 수" 표
         self.missing_log = []       # handle_missing_values()를 부를 때마다 한 줄(딕셔너리)씩 쌓임
+        self.cancel_rows = None     # clean_transactions()가 지운 취소 전표(원 주문과 짝을 맞출 때 필요)
+        self.cancelled_orders = None  # remove_cancelled_orders()가 지운 "취소로 사라진 원 주문" 행들
 
     # ───────────── 불러오기 ─────────────
     def load_data(self, date_cols=None, rename=None, **read_csv_kwargs):
@@ -95,6 +129,7 @@ class DataAnalyzer:
         # ② 취소 주문 제거: 주문번호가 'C'로 시작하면 취소(수량이 음수로 기록됨)
         before = len(df)
         is_cancel = df["invoice"].str.startswith("C", na=False)
+        self.cancel_rows = df[is_cancel]                 # 지우기 전에 기억: 나중에 취소와 원 주문의 짝을 맞출 때 씀
         df = df[~is_cancel]                              # ~ 는 "반대로": 취소가 아닌 행만 남김
         steps.append(("취소 주문(주문번호 C…) 제거", before - len(df), len(df)))
 
@@ -202,3 +237,116 @@ class DataAnalyzer:
         }
         self.missing_log.append(row)
         return pd.DataFrame([row])
+
+    # ───────────── 이상치 ─────────────
+    def _numeric_column(self, column):
+        """이상치 계산 전에 표가 있는지, 숫자 컬럼이 맞는지 점검하고 그 컬럼을 돌려준다."""
+        if self.df is None:
+            raise ValueError("먼저 load_data()로 데이터를 불러오세요.")
+        if column not in self.df.columns:
+            raise KeyError(f"표에 없는 컬럼입니다: {column!r}")
+        if not pd.api.types.is_numeric_dtype(self.df[column]):
+            raise TypeError(f"{column!r}는 숫자 컬럼이 아니라 IQR을 구할 수 없습니다.")
+        return self.df[column]
+
+    def detect_outliers(self, column, threshold=1.5):
+        """column 값이 IQR 정상 범위를 벗어난 행들을 돌려준다. (self.df 자체는 바꾸지 않는다)
+
+        threshold : IQR에 곱하는 배수. 기본 1.5. 크게 하면 더 극단적인 값만 이상치로 잡힌다.
+        """
+        values = self._numeric_column(column)
+        bounds = iqr_bounds(values, threshold)
+        is_outlier = (values < bounds["lower"]) | (values > bounds["upper"])   # 범위 밖이면 True
+        return self.df[is_outlier]
+
+    def outlier_summary(self, columns, threshold=1.5):
+        """여러 컬럼의 Q1·Q3·IQR·정상 범위와 이상치 개수·비율을 한 표로 보여 준다."""
+        rows = []
+        for column in columns:
+            values = self._numeric_column(column)
+            bounds = iqr_bounds(values, threshold)
+            below = int((values < bounds["lower"]).sum())     # 하한보다 작은 값
+            above = int((values > bounds["upper"]).sum())     # 상한보다 큰 값
+            rows.append({
+                "컬럼": column, "Q1": bounds["q1"], "Q3": bounds["q3"], "IQR": bounds["iqr"],
+                "하한": bounds["lower"], "상한": bounds["upper"],
+                "아래쪽 이상치": below, "위쪽 이상치": above, "이상치 수": below + above,
+                "비율(%)": round((below + above) / values.notna().sum() * 100, 2),
+            })
+        return pd.DataFrame(rows)
+
+    # ───────────── 추가 정제 (이상치를 살펴보다 발견한 문제) ─────────────
+    def _append_cleaning_log(self, label, removed):
+        """cleaning_log 맨 아래에 "이 단계에서 removed행을 지웠고 지금 len(self.df)행 남았다"를 한 줄 더한다."""
+        row = pd.DataFrame([(label, int(removed), len(self.df))], columns=["단계", "제거한 행", "남은 행"])
+        self.cleaning_log = pd.concat([self.cleaning_log, row], ignore_index=True)
+        return self.cleaning_log
+
+    def remove_non_product_rows(self, codes=None):
+        """상품이 아닌 코드(배송비·수기 입력·수수료·조정·테스트)의 행을 지운다.
+
+        codes : 지울 상품코드 목록. 안 주면 NON_PRODUCT_CODES(14종)를 쓴다.
+        clean_transactions() 다음에 부른다. 단계별 제거 표(누적)를 돌려준다.
+        """
+        if self.cleaning_log is None:
+            raise ValueError("먼저 clean_transactions()를 실행하세요.")
+        codes = NON_PRODUCT_CODES if codes is None else codes
+        is_non_product = self.df["stock_code"].isin(codes)       # 비판매 코드이면 True
+        removed = int(is_non_product.sum())
+        self.df = self.df[~is_non_product].reset_index(drop=True)
+        return self._append_cleaning_log(f"비판매 코드 제거 ({len(codes)}종)", removed)
+
+    def remove_cancelled_orders(self, hours=24):
+        """취소로 상쇄된 원 주문을 지운다.
+
+        clean_transactions()는 취소 전표(주문번호 C…)만 지우므로, 이미 취소된 원 주문이 "판매"로 남아 있다.
+        아래 조건을 모두 만족하는 취소 전표가 있으면 그 원 주문을 없던 일로 보고 지운다.
+          · 같은 고객, 같은 상품, 같은 수량(전량 취소)
+          · 취소가 원 주문 뒤 hours시간 이내
+        취소 한 건은 가장 가까운 앞선 원 주문 한 건만 지운다. 고객 번호가 비어 있으면 짝을 맞출 수 없어 건너뛴다.
+        지운 원 주문은 self.cancelled_orders 에 남긴다. 단계별 제거 표(누적)를 돌려준다.
+        """
+        if self.cancel_rows is None or self.cleaning_log is None:
+            raise ValueError("먼저 clean_transactions()를 실행하세요 (취소 전표를 기억해 둬야 짝을 맞출 수 있습니다).")
+        if hours <= 0:
+            raise ValueError(f"hours는 0보다 커야 합니다: {hours}")
+        key = ["customer_id", "stock_code", "quantity"]
+
+        # 원 주문 후보: 고객 번호가 있는 행. 행 번호(row_id)를 같이 들고 다닌다.
+        sales = self.df.loc[self.df["customer_id"].notna(), key + ["order_date"]].copy()
+        sales["row_id"] = sales.index
+        # 취소 전표: 수량은 음수(-5)로 적혀 있으니 부호를 바꿔 원 주문 수량(5)과 비교한다.
+        cancels = self.cancel_rows.dropna(subset=["customer_id"])[key + ["order_date"]].copy()
+        cancels["quantity"] = -cancels["quantity"]
+
+        # 취소마다 "같은 (고객, 상품, 수량)이면서 취소 시각 이전 hours시간 안에서 가장 가까운 원 주문"을 찾는다.
+        matched = pd.merge_asof(
+            cancels.sort_values("order_date"), sales.sort_values("order_date"),
+            on="order_date", by=key, direction="backward", tolerance=pd.Timedelta(hours=hours),
+        )
+        drop_ids = matched["row_id"].dropna().astype(int).unique()    # 짝이 맞은 원 주문의 행 번호
+        self.cancelled_orders = self.df.loc[drop_ids]
+        self.df = self.df.drop(index=drop_ids).reset_index(drop=True)
+        return self._append_cleaning_log(f"취소와 짝이 맞는 원 주문 제거 (같은 고객·상품·수량, {hours}시간 이내)", len(drop_ids))
+
+    # ───────────── 이상치 처리 ─────────────
+    def treat_outliers(self, column, method="clip", threshold=1.5):
+        """이상치를 처리한 "새 값 목록(Series)"을 돌려준다. self.df 와 원본 컬럼은 바뀌지 않는다.
+
+        method="clip"   : 정상 범위 밖의 값을 하한/상한 값으로 자른다. (행·개수는 그대로)
+        method="remove" : 정상 범위 밖의 값을 빈칸(NaN)으로 바꿔 평균 등 통계에서 제외한다. (행은 그대로)
+        돌려받은 값은 df["amount_clipped"] = analyzer.treat_outliers("amount") 처럼 새 컬럼으로 붙여 쓴다.
+        (원본 컬럼은 그대로 두므로, RFM처럼 원본이 필요한 계산에는 영향이 없다.)
+        """
+        if method not in ("clip", "remove"):
+            raise ValueError(f"method는 'clip' 또는 'remove'여야 합니다: {method!r}")
+        values = self._numeric_column(column)
+        bounds = iqr_bounds(values, threshold)
+        if method == "clip":
+            treated = values.clip(lower=bounds["lower"], upper=bounds["upper"])         # 범위 밖은 경계값으로
+            treated.name = f"{column}_clipped"
+        else:
+            in_range = (values >= bounds["lower"]) & (values <= bounds["upper"])
+            treated = values.where(in_range)                                            # 범위 밖은 NaN
+            treated.name = f"{column}_removed"
+        return treated
