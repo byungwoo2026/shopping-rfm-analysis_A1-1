@@ -67,6 +67,20 @@ def _mode(values):
     return counts.iloc[0] if len(counts) else np.nan
 
 
+# 고객 세그먼트 규칙: {이름: 조건을 계산하는 함수}. 위에서부터 차례로 보고 먼저 맞는 이름을 붙인다.
+# (순서가 중요: VIP 조건을 만족하는 고객이 Loyal로 먼저 빠지지 않도록 VIP를 맨 위에 둔다.)
+# 함수는 RFM 표(rfm)를 받아 "그 세그먼트인 고객이면 True"인 판정표를 돌려준다.
+# New는 점수가 아니라 실제 구매 횟수(frequency == 1)로 판정한다. F 점수는 동점을 행 순서로 가르기 때문에
+# 같은 1회 구매 고객이 서로 다른 점수를 받을 수 있어서다.
+DEFAULT_SEGMENT_RULES = {
+    "VIP":     lambda rfm: (rfm["r_score"] >= 4) & (rfm["f_score"] >= 4) & (rfm["m_score"] >= 4),   # 최근에, 자주, 많이
+    "Loyal":   lambda rfm: (rfm["r_score"] >= 3) & (rfm["f_score"] >= 3),                           # 꾸준히 오는 고객
+    "New":     lambda rfm: (rfm["r_score"] >= 4) & (rfm["frequency"] == 1),                         # 최근에 처음 온 고객
+    "At Risk": lambda rfm: (rfm["r_score"] <= 2) & (rfm["f_score"] >= 3),                           # 자주 왔는데 요즘 안 오는 고객
+    "Churned": lambda rfm: rfm["r_score"] <= 2,                                                      # 오래 안 온 이탈 고객
+}
+
+
 # 결측 대치 전략 이름 → 그룹의 대표값을 구하는 방법
 _STRATEGIES = {
     "group_mean": "mean",       # 평균 (숫자 컬럼용)
@@ -90,6 +104,9 @@ class DataAnalyzer:
         self.cancel_rows = None     # clean_transactions()가 지운 취소 전표(원 주문과 짝을 맞출 때 필요)
         self.cancelled_orders = None  # remove_cancelled_orders()가 지운 "취소로 사라진 원 주문" 행들
         self.image_log = None       # load_images()가 남기는 "사진을 몇 장 찾고 몇 장 썼는지" 기록
+        self.rfm = None             # calculate_rfm()이 만드는 고객별 R·F·M 표 (segment_customers()가 세그먼트 컬럼을 더함)
+        self.rfm_info = None        # calculate_rfm()의 기준일·제외한 행 같은 기록
+        self.segment_order = None   # segment_customers()가 쓴 세그먼트 이름 순서 (요약표 정렬용)
 
     # ───────────── 불러오기 ─────────────
     def load_data(self, date_cols=None, rename=None, **read_csv_kwargs):
@@ -457,3 +474,100 @@ class DataAnalyzer:
         })
         table["평균/중앙값"] = table["평균"] / table["중앙값"]
         return table
+
+    # ───────────── RFM ─────────────
+    @staticmethod
+    def _quintile_score(values, labels):
+        """값을 작은 순서로 줄 세워 5등분하고, 구간마다 labels[0]~labels[4] 점수를 준다.
+
+        pd.qcut 은 같은 값이 너무 많으면 구간 경계가 겹쳐 오류가 난다. 그래서 먼저 rank(method="first")로
+        같은 값에도 줄 번호를 따로 매긴 뒤 나눈다. (부작용: 같은 값이 행 순서에 따라 다른 점수를 받을 수 있다.)
+        """
+        ranks = values.rank(method="first")                       # 같은 값도 1, 2, 3 … 처럼 서로 다른 순위
+        return pd.qcut(ranks, 5, labels=labels).astype(int)       # 순위 기준으로 5등분
+
+    def calculate_rfm(self, customer_col, date_col, amount_col, invoice_col=None, ref_date=None):
+        """고객별 R(최근성)·F(빈도)·M(금액)과 1~5점을 계산해 표로 돌려준다. (고객 번호가 인덱스)
+
+        customer_col : 고객 번호 컬럼. 이 값이 빈 행은 누구인지 몰라서 계산에서 뺀다
+        date_col     : 주문 시각 컬럼
+        amount_col   : 한 줄의 금액 컬럼 (원본 금액. 극단값을 자른 컬럼이 아니다)
+        invoice_col  : 주문번호 컬럼. 주면 F = 고유 주문번호 수, 안 주면 F = 행 수
+                       (한 주문에 상품이 여러 줄이면 행 수는 방문 횟수가 아니라 장바구니 크기를 재게 된다)
+        ref_date     : 기준일. 안 주면 "마지막 거래일 + 1일"을 쓴다.
+                       +1일의 이유: 마지막 날 구매한 고객의 R이 0일이 되는 것을 피하고 모두 1일 이상으로 계산하려고
+
+        recency   = 기준일 − 고객의 마지막 구매일 (일수, 작을수록 좋음)
+        frequency = 주문 횟수 (클수록 좋음)
+        monetary  = 구매 금액 합계 (클수록 좋음)
+        r_score·f_score·m_score = 고객 순위를 5등분한 1~5점 (5점이 가장 좋음. R은 작을수록 좋아서 점수를 거꾸로 매김)
+        """
+        if self.df is None:
+            raise ValueError("먼저 load_data()로 데이터를 불러오세요.")
+        needed = [customer_col, date_col, amount_col] + ([invoice_col] if invoice_col else [])
+        missing = [c for c in needed if c not in self.df.columns]
+        if missing:
+            raise KeyError(f"표에 없는 컬럼입니다: {missing}")
+
+        data = self.df.dropna(subset=[customer_col])                     # 누구인지 아는 행만
+        if data.empty:
+            raise ValueError("고객 번호가 있는 행이 없습니다.")
+        last_date = data[date_col].max()
+        ref_date = last_date.normalize() + pd.Timedelta(days=1) if ref_date is None else pd.Timestamp(ref_date).normalize()
+        if ref_date < last_date.normalize():
+            raise ValueError(f"기준일({ref_date:%Y-%m-%d})이 마지막 거래일({last_date:%Y-%m-%d})보다 앞서면 R이 음수가 됩니다.")
+
+        grouped = data.groupby(customer_col)                              # 고객별로 묶기
+        rfm = pd.DataFrame({
+            "recency": (ref_date - grouped[date_col].max().dt.normalize()).dt.days,   # 기준일 − 마지막 구매일 (일수)
+            "frequency": grouped[invoice_col].nunique() if invoice_col else grouped[date_col].size(),
+            "monetary": grouped[amount_col].sum(),
+        })
+        if len(rfm) < 5:
+            raise ValueError(f"고객이 {len(rfm)}명뿐이라 5등분할 수 없습니다(최소 5명).")
+        if pd.api.types.is_float_dtype(rfm.index) and (rfm.index == rfm.index.astype("int64")).all():
+            rfm.index = rfm.index.astype("int64")                  # 빈칸 때문에 소수형이 된 고객 번호를 12346.0 대신 12346으로
+        rfm["r_score"] = self._quintile_score(rfm["recency"], [5, 4, 3, 2, 1])     # R은 작을수록 좋으므로 점수를 거꾸로
+        rfm["f_score"] = self._quintile_score(rfm["frequency"], [1, 2, 3, 4, 5])
+        rfm["m_score"] = self._quintile_score(rfm["monetary"], [1, 2, 3, 4, 5])
+
+        self.rfm = rfm
+        self.rfm_info = {
+            "기준일": ref_date, "마지막 거래 시각": last_date, "RFM 대상 고객 수": len(rfm),
+            "고객 번호가 없어 제외한 행": len(self.df) - len(data),
+            "제외한 행의 금액": float(self.df.loc[self.df[customer_col].isna(), amount_col].sum()),
+        }
+        return rfm
+
+    def segment_customers(self, rules=None, default="Others"):
+        """RFM 점수로 고객에게 세그먼트 이름을 붙여, rfm 표의 segment 컬럼에 넣고 표를 돌려준다.
+
+        rules   : {세그먼트 이름: 조건 함수} 딕셔너리. 안 주면 DEFAULT_SEGMENT_RULES.
+                  위에서부터 차례로 보고 먼저 맞는 이름을 붙인다 (순서가 중요).
+        default : 어떤 규칙에도 안 맞는 고객의 이름
+        """
+        if self.rfm is None:
+            raise ValueError("먼저 calculate_rfm()으로 RFM을 계산하세요.")
+        rules = DEFAULT_SEGMENT_RULES if rules is None else rules
+        conditions = [rule(self.rfm) for rule in rules.values()]          # 규칙마다 "맞는 고객이면 True"인 판정표
+        # np.select: 판정표를 순서대로 보고 처음 True인 규칙의 이름을 고른다. 모두 False면 default
+        self.rfm["segment"] = np.select(conditions, list(rules), default=default)
+        self.segment_order = list(rules) + [default]
+        return self.rfm
+
+    def segment_summary(self):
+        """세그먼트별 고객 수·평균 금액·매출 비중 요약표를 돌려준다. (segment_customers() 다음에 부른다)"""
+        if self.rfm is None or "segment" not in self.rfm.columns:
+            raise ValueError("먼저 segment_customers()로 세그먼트를 붙이세요.")
+        grouped = self.rfm.groupby("segment")
+        table = pd.DataFrame({
+            "고객 수": grouped.size(),
+            "평균 최근성 R(일)": grouped["recency"].mean(),
+            "평균 구매 횟수 F": grouped["frequency"].mean(),
+            "평균 금액 M": grouped["monetary"].mean(),
+            "매출 합계": grouped["monetary"].sum(),
+        })
+        table.insert(1, "고객 비율(%)", table["고객 수"] / table["고객 수"].sum() * 100)
+        table["매출 비중(%)"] = table["매출 합계"] / table["매출 합계"].sum() * 100
+        order = [name for name in self.segment_order if name in table.index]    # 규칙 순서대로
+        return table.loc[order]
