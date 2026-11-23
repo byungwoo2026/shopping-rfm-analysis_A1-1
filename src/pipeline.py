@@ -249,7 +249,7 @@ class DataAnalyzer:
         if column not in self.df.columns:
             raise KeyError(f"표에 없는 컬럼입니다: {column!r}")
         if not pd.api.types.is_numeric_dtype(self.df[column]):
-            raise TypeError(f"{column!r}는 숫자 컬럼이 아니라 IQR을 구할 수 없습니다.")
+            raise TypeError(f"{column!r}는 숫자 컬럼이 아니라 계산할 수 없습니다.")
         return self.df[column]
 
     def detect_outliers(self, column, threshold=1.5):
@@ -436,3 +436,24 @@ class DataAnalyzer:
         features.insert(0, "id", list(ids))
         self.df = self.df.drop(columns=["image_mean", "image_std"], errors="ignore").merge(features, on="id", how="left")
         return features
+
+    # ───────────── 통계 요약 ─────────────
+    def summary_stats(self, columns):
+        """숫자 컬럼들의 기초 통계를 한 표로 보여 준다. (컬럼마다 한 줄)
+
+        개수, 평균, 중앙값, 표준편차, 최솟값, Q1(25% 지점), Q3(75% 지점), 최댓값, 그리고
+        '평균/중앙값'(1보다 훨씬 크면 큰 극단값이 평균을 끌어올린 오른쪽 꼬리 분포).
+        표준편차는 pandas 방식(하나 뺀 값으로 나누는 표본 표준편차)이다.
+        """
+        if self.df is None:
+            raise ValueError("먼저 load_data()로 데이터를 불러오세요.")
+        columns = list(columns)
+        for column in columns:                                  # 표에 있는 숫자 컬럼인지 점검
+            self._numeric_column(column)
+        data = self.df[columns]
+        table = pd.DataFrame({
+            "개수": data.count(), "평균": data.mean(), "중앙값": data.median(), "표준편차": data.std(),
+            "최솟값": data.min(), "Q1": data.quantile(0.25), "Q3": data.quantile(0.75), "최댓값": data.max(),
+        })
+        table["평균/중앙값"] = table["평균"] / table["중앙값"]
+        return table
